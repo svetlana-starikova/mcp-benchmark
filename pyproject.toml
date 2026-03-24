@@ -1,0 +1,19 @@
+[project]
+name = "mcp-client"
+version = "0.1.0"
+description = "MCP SSE Client Test - Tests gateway vs direct connection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp>=1.26.0",
+    "requests>=2.32.5",
+]
+
+[project.scripts]
+test-mcp = "client:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+]
