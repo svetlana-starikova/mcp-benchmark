@@ -4,7 +4,6 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
 use std::os::linux::net::TcpStreamExt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +16,10 @@ struct Args {
 
     #[arg(short = 'r', default_value = "100")]
     runs: usize,
+
+    /// Number of runs for init and tools/list (default: same as runs)
+    #[arg(short = 'i', default_value = None)]
+    init_runs: Option<usize>,
 
     #[arg(short = 't', default_value = "say_hello")]
     tool_name: String,
@@ -32,6 +35,56 @@ struct UserSession {
     session_id: String,
 }
 
+#[derive(Clone)]
+struct PhaseStats {
+    name: &'static str,
+    total_requests: usize,
+    successful_requests: usize,
+    failed_requests: usize,
+    total_latency: Duration,
+    elapsed: Duration,
+}
+
+impl PhaseStats {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            total_latency: Duration::ZERO,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn avg_latency_ms(&self) -> f64 {
+        if self.successful_requests > 0 {
+            self.total_latency.as_secs_f64() / self.successful_requests as f64 * 1000.0
+        } else {
+            0.0
+        }
+    }
+
+    fn throughput(&self) -> f64 {
+        if self.elapsed.as_secs_f64() > 0.0 {
+            self.successful_requests as f64 / self.elapsed.as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+
+    fn print_results(&self) {
+        println!("\n📊 {} Results:", self.name);
+        println!(
+            "   Total: {} requests ({} success, {} failed)",
+            self.total_requests, self.successful_requests, self.failed_requests
+        );
+        println!("   Elapsed: {:.2?}", self.elapsed);
+        println!("   Avg latency: {:.2}ms", self.avg_latency_ms());
+        println!("   Throughput: {:.2} req/s", self.throughput());
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
 
@@ -45,8 +98,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let url = &args.server_url;
+    let init_runs = args.init_runs.unwrap_or(args.runs);
     let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"demo","version":"0.0.1"}}}"#;
     let notify_req = r#"{"jsonrpc": "2.0","method": "notifications/initialized"}"#;
+    let list_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
     let call_req = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"{}","arguments":{}}}}}"#,
         args.tool_name, args.args
@@ -66,16 +121,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // Create sessions for each virtual user
-    let mut sessions: Vec<UserSession> = Vec::with_capacity(args.users);
+    println!("🔌 MCP Streamable HTTP Benchmark");
+    println!("   Transport: Streamable HTTP");
+    println!(
+        "   Users: {}, Init runs: {}, Tool call runs: {}",
+        args.users, init_runs, args.runs
+    );
+    println!("   Server: {}", args.server_url);
 
-    for i in 0..args.users {
+    // Best-effort tool verification (to match sdk-benchmark output shape)
+    println!("   Verifying tool '{}' exists...", args.tool_name);
+    verify_tool_exists(
+        &client,
+        url,
+        &base_headers,
+        init_req,
+        notify_req,
+        list_req,
+        &args.tool_name,
+    )?;
+    println!("   ✅ Tool '{}' found", args.tool_name);
+
+    // Phase 1: Init benchmark (initialize + notifications/initialized)
+    println!(
+        "\n🚀 Phase 1 - Init Benchmark: {} clients × {} runs = {} total requests",
+        args.users,
+        init_runs,
+        args.users * init_runs
+    );
+    println!("   Server: {}", args.server_url);
+    let init_phase = run_init_phase(
+        &client,
+        url,
+        &base_headers,
+        init_req,
+        notify_req,
+        args.users,
+        init_runs,
+    );
+    init_phase.print_results();
+
+    // Create sessions for list/tools and tool/call phases
+    let sessions = create_sessions(
+        &client,
+        url,
+        &base_headers,
+        init_req,
+        notify_req,
+        args.users,
+    )?;
+
+    // Phase 2: Tool/list benchmark (reuse sessions)
+    println!(
+        "\n🚀 Phase 2 - Tool/list Benchmark: {} clients × {} runs = {} total requests",
+        args.users,
+        init_runs,
+        args.users * init_runs
+    );
+    println!("   Server: {}", args.server_url);
+    let list_phase = run_list_phase(
+        &client,
+        url,
+        &base_headers,
+        &sessions,
+        list_req,
+        init_runs,
+    )?;
+    list_phase.print_results();
+
+    // Phase 3: Tool call benchmark (reuse sessions)
+    println!(
+        "\n🚀 Phase 3 - Tool Call Benchmark: {} clients × {} runs = {} total requests",
+        args.users,
+        args.runs,
+        args.users * args.runs
+    );
+    println!("   Server: {}", args.server_url);
+    println!("   Tool: {}", args.tool_name);
+    let tool_call_phase = run_tool_call_phase(
+        &client,
+        url,
+        &base_headers,
+        &sessions,
+        &call_req,
+        args.runs,
+    )?;
+    tool_call_phase.print_results();
+
+    println!("\n📈 Summary:");
+    println!(
+        "   Init:      {:.2} req/s,  {:.2}ms avg latency",
+        init_phase.throughput(),
+        init_phase.avg_latency_ms()
+    );
+    println!(
+        "   Tool/list: {:.2} req/s,  {:.2}ms avg latency",
+        list_phase.throughput(),
+        list_phase.avg_latency_ms()
+    );
+    println!(
+        "   Tool call: {:.2} req/s,  {:.2}ms avg latency",
+        tool_call_phase.throughput(),
+        tool_call_phase.avg_latency_ms()
+    );
+
+    Ok(())
+}
+
+fn verify_tool_exists(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    base_headers: &HeaderMap,
+    init_req: &str,
+    notify_req: &str,
+    list_req: &str,
+    tool_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sessions = create_sessions(client, url, base_headers, init_req, notify_req, 1)?;
+    let session_id = &sessions[0].session_id;
+
+    let mut headers = base_headers.clone();
+    headers.insert("Mcp-Session-Id", HeaderValue::from_str(session_id)?);
+
+    let resp = client.post(url).body(list_req.to_string()).headers(headers).send()?;
+    let body = resp.text()?;
+
+    // Best-effort match: rmcp/go servers typically include tool names in JSON content.
+    if body.contains(tool_name) {
+        Ok(())
+    } else {
+        Err(format!("Tool '{}' not found", tool_name).into())
+    }
+}
+
+fn create_sessions(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    base_headers: &HeaderMap,
+    init_req: &str,
+    notify_req: &str,
+    users: usize,
+) -> Result<Vec<UserSession>, Box<dyn std::error::Error>> {
+    let mut sessions: Vec<UserSession> = Vec::with_capacity(users);
+
+    for i in 0..users {
         // Step 1: Initialize
-        let mut req = client
+        let resp = client
             .post(url)
             .body(init_req.to_string())
-            .headers(base_headers.clone());
-        let resp = req.send()?;
+            .headers(base_headers.clone())
+            .send()?;
 
         let session_id = resp
             .headers()
@@ -89,135 +284,268 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Step 2: Notify
         let mut notify_headers = base_headers.clone();
         notify_headers.insert("Mcp-Session-Id", HeaderValue::from_str(&session_id)?);
-        req = client
+        let resp = client
             .post(url)
             .body(notify_req.to_string())
-            .headers(notify_headers);
-        let resp = req.send()?;
+            .headers(notify_headers)
+            .send()?;
         resp.text()?; // consume response body
 
         sessions.push(UserSession { session_id });
     }
 
-    // Benchmark tool calls with all users in parallel
-    let all_latencies = Arc::new(Mutex::new(Vec::new()));
-    let successful_requests = Arc::new(AtomicUsize::new(0));
-    let failed_requests = Arc::new(AtomicUsize::new(0));
-    let bench_start = Instant::now();
+    Ok(sessions)
+}
 
-    // Prepare request bytes once before the loop
-    let mut prepared_requests: Vec<(Vec<u8>, String, u16)> = Vec::with_capacity(args.users);
-    for i in 0..args.users {
-        let mut req = client.post(url).body(call_req.clone()).headers({
-            let mut h = base_headers.clone();
-            h.insert(
-                "Mcp-Session-Id",
-                HeaderValue::from_str(&sessions[i].session_id).unwrap(),
-            );
-            h
-        });
-        let (bytes, host, port) = prepare_request_bytes(&mut req)?;
-        prepared_requests.push((bytes, host, port));
-    }
+fn run_init_phase(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    base_headers: &HeaderMap,
+    init_req: &str,
+    notify_req: &str,
+    users: usize,
+    runs_per_user: usize,
+) -> PhaseStats {
+    let result = Arc::new(Mutex::new(PhaseStats::new("Init")));
+    let start = Instant::now();
 
     let mut handles = Vec::new();
-    for i in 0..args.users {
-        let (prepared_bytes, host, port) = prepared_requests.remove(0);
-        let runs = args.runs;
-        let all_latencies = Arc::clone(&all_latencies);
-        let successful_requests = Arc::clone(&successful_requests);
-        let failed_requests = Arc::clone(&failed_requests);
+    for user_idx in 0..users {
+        let client = client.clone();
+        let url = url.to_string();
+        let base_headers = base_headers.clone();
+        let init_req = init_req.to_string();
+        let notify_req = notify_req.to_string();
+        let result = Arc::clone(&result);
 
         let handle = std::thread::spawn(move || {
-            let mut local_latencies = Vec::new();
-            let mut local_success = 0;
-            let mut local_failed = 0;
-            for j in 0..runs {
-                match measure_request(&prepared_bytes, &host, port) {
-                    Ok(latency) => {
-                        local_latencies.push(latency);
-                        local_success += 1;
-                    }
+            let mut local_success = 0usize;
+            let mut local_failed = 0usize;
+            let mut local_total_latency = Duration::ZERO;
+
+            for j in 0..runs_per_user {
+                let t0 = Instant::now();
+
+                let resp = match client
+                    .post(&url)
+                    .body(init_req.clone())
+                    .headers(base_headers.clone())
+                    .send()
+                {
+                    Ok(r) => r,
                     Err(e) => {
-                        eprintln!("user {} request {}: {}", i, j, e);
+                        if j == 0 {
+                            eprintln!("user {} init request {}: {}", user_idx, j, e);
+                        }
                         local_failed += 1;
+                        continue;
                     }
+                };
+
+                let session_id = match resp
+                    .headers()
+                    .get("Mcp-Session-Id")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    _ => {
+                        if j == 0 {
+                            eprintln!("user {} init request {}: no session id", user_idx, j);
+                        }
+                        local_failed += 1;
+                        continue;
+                    }
+                };
+
+                if resp.text().is_err() {
+                    local_failed += 1;
+                    continue;
                 }
+
+                let mut notify_headers = base_headers.clone();
+                if let Ok(v) = HeaderValue::from_str(&session_id) {
+                    notify_headers.insert("Mcp-Session-Id", v);
+                } else {
+                    local_failed += 1;
+                    continue;
+                }
+
+                let resp = match client
+                    .post(&url)
+                    .body(notify_req.clone())
+                    .headers(notify_headers)
+                    .send()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if j == 0 {
+                            eprintln!("user {} notify request {}: {}", user_idx, j, e);
+                        }
+                        local_failed += 1;
+                        continue;
+                    }
+                };
+
+                if resp.text().is_err() {
+                    local_failed += 1;
+                    continue;
+                }
+
+                local_success += 1;
+                local_total_latency += t0.elapsed();
             }
 
-            let mut latencies = all_latencies.lock().unwrap();
-            latencies.extend(local_latencies);
-
-            successful_requests.fetch_add(local_success, Ordering::Relaxed);
-            failed_requests.fetch_add(local_failed, Ordering::Relaxed);
+            let mut r = result.lock().unwrap();
+            r.total_requests += runs_per_user;
+            r.successful_requests += local_success;
+            r.failed_requests += local_failed;
+            r.total_latency += local_total_latency;
         });
 
         handles.push(handle);
     }
 
-    for handle in handles {
-        handle.join().unwrap();
+    for h in handles {
+        let _ = h.join();
     }
 
-    let bench_end = Instant::now();
-    let total_elapsed = bench_end.duration_since(bench_start);
-    let total_runs = args.runs * args.users;
-    let avg_elapsed = total_elapsed / total_runs as u32;
+    let mut r = result.lock().unwrap();
+    r.elapsed = start.elapsed();
+    r.clone()
+}
 
-    let latencies = all_latencies.lock().unwrap();
-    let success_count = successful_requests.load(Ordering::Relaxed);
-    let failed_count = failed_requests.load(Ordering::Relaxed);
-    let (total, min, max) = if latencies.is_empty() {
-        (Duration::ZERO, Duration::ZERO, Duration::ZERO)
-    } else {
-        let total = latencies.iter().sum::<Duration>();
-        let min = *latencies.iter().min().unwrap();
-        let max = *latencies.iter().max().unwrap();
-        (total, min, max)
-    };
+fn run_list_phase(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    base_headers: &HeaderMap,
+    sessions: &[UserSession],
+    list_req: &str,
+    runs_per_user: usize,
+) -> Result<PhaseStats, Box<dyn std::error::Error>> {
+    let result = Arc::new(Mutex::new(PhaseStats::new("Tool/list")));
+    let start = Instant::now();
 
-    let avg = if latencies.is_empty() {
-        Duration::ZERO
-    } else {
-        total / latencies.len() as u32
-    };
+    // Prepare request bytes once per user (includes Mcp-Session-Id)
+    let mut prepared: Vec<(Vec<u8>, String, u16)> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let mut req = client.post(url).body(list_req.to_string()).headers({
+            let mut h = base_headers.clone();
+            h.insert(
+                "Mcp-Session-Id",
+                HeaderValue::from_str(&session.session_id)?,
+            );
+            h
+        });
+        let (bytes, host, port) = prepare_request_bytes(&mut req)?;
+        prepared.push((bytes, host, port));
+    }
 
-    let rps = if avg.as_nanos() > 0 {
-        1e9 / avg.as_nanos() as f64
-    } else {
-        0.0
-    };
+    let mut handles = Vec::new();
+    for (user_idx, (bytes, host, port)) in prepared.into_iter().enumerate() {
+        let result = Arc::clone(&result);
+        let handle = std::thread::spawn(move || {
+            let mut local_success = 0usize;
+            let mut local_failed = 0usize;
+            let mut local_total_latency = Duration::ZERO;
 
-    let throughput_rps = if total_elapsed.as_secs_f64() > 0.0 {
-        total_runs as f64 / total_elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
+            for j in 0..runs_per_user {
+                match measure_request(&bytes, &host, port) {
+                    Ok(lat) => {
+                        local_total_latency += lat;
+                        local_success += 1;
+                    }
+                    Err(e) => {
+                        if j == 0 {
+                            eprintln!("user {} tools/list request {}: {}", user_idx, j, e);
+                        }
+                        local_failed += 1;
+                    }
+                }
+            }
 
-    println!("Virtual users: {}", args.users);
-    println!("Runs per user: {}", args.runs);
-    println!("Total requests: {}", total_runs);
-    println!("Total elapsed: {:?}", total_elapsed);
-    println!("Avg latency (individual): {:?}", avg);
-    println!("Avg latency (throughput): {:?}", avg_elapsed);
-    println!("Min latency: {:?}", min);
-    println!("Max latency: {:?}", max);
-    println!("P50 latency: {:?}", percentile(&latencies, 50));
-    println!("P95 latency: {:?}", percentile(&latencies, 95));
-    println!("P99 latency: {:?}", percentile(&latencies, 99));
-    println!("RPS (individual): {:.2}", rps);
-    println!("RPS (throughput): {:.2}", throughput_rps);
-    println!("\nRequests:");
-    println!("  Successful: {}", success_count);
-    println!("  Failed: {}", failed_count);
-    let success_rate = if total_runs > 0 {
-        (success_count as f64 / total_runs as f64) * 100.0
-    } else {
-        0.0
-    };
-    println!("  Success Rate: {:.2}%", success_rate);
+            let mut r = result.lock().unwrap();
+            r.total_requests += runs_per_user;
+            r.successful_requests += local_success;
+            r.failed_requests += local_failed;
+            r.total_latency += local_total_latency;
+        });
+        handles.push(handle);
+    }
 
-    Ok(())
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let mut r = result.lock().unwrap();
+    r.elapsed = start.elapsed();
+    Ok(r.clone())
+}
+
+fn run_tool_call_phase(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    base_headers: &HeaderMap,
+    sessions: &[UserSession],
+    call_req: &str,
+    runs_per_user: usize,
+) -> Result<PhaseStats, Box<dyn std::error::Error>> {
+    let result = Arc::new(Mutex::new(PhaseStats::new("Tool call")));
+    let start = Instant::now();
+
+    // Prepare request bytes once per user (includes Mcp-Session-Id)
+    let mut prepared: Vec<(Vec<u8>, String, u16)> = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let mut req = client.post(url).body(call_req.to_string()).headers({
+            let mut h = base_headers.clone();
+            h.insert(
+                "Mcp-Session-Id",
+                HeaderValue::from_str(&session.session_id)?,
+            );
+            h
+        });
+        let (bytes, host, port) = prepare_request_bytes(&mut req)?;
+        prepared.push((bytes, host, port));
+    }
+
+    let mut handles = Vec::new();
+    for (user_idx, (bytes, host, port)) in prepared.into_iter().enumerate() {
+        let result = Arc::clone(&result);
+        let handle = std::thread::spawn(move || {
+            let mut local_success = 0usize;
+            let mut local_failed = 0usize;
+            let mut local_total_latency = Duration::ZERO;
+
+            for j in 0..runs_per_user {
+                match measure_request(&bytes, &host, port) {
+                    Ok(lat) => {
+                        local_total_latency += lat;
+                        local_success += 1;
+                    }
+                    Err(e) => {
+                        if j == 0 {
+                            eprintln!("user {} tool call request {}: {}", user_idx, j, e);
+                        }
+                        local_failed += 1;
+                    }
+                }
+            }
+
+            let mut r = result.lock().unwrap();
+            r.total_requests += runs_per_user;
+            r.successful_requests += local_success;
+            r.failed_requests += local_failed;
+            r.total_latency += local_total_latency;
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let mut r = result.lock().unwrap();
+    r.elapsed = start.elapsed();
+    Ok(r.clone())
 }
 
 fn prepare_request_bytes(
@@ -286,13 +614,4 @@ fn measure_request(
     }
 }
 
-fn percentile(data: &[Duration], p: usize) -> Duration {
-    if data.is_empty() {
-        return Duration::ZERO;
-    }
-    let mut sorted: Vec<Duration> = data.to_vec();
-    sorted.sort();
-    let idx = sorted.len() * p / 100;
-    let idx = idx.min(sorted.len() - 1);
-    sorted[idx]
-}
+// (percentile helper removed; sdk-benchmark-style output doesn't use it)
