@@ -1,5 +1,10 @@
+use base64::Engine;
 use clap::Parser;
+use hmac::{Hmac, Mac};
+use log::{debug, info};
+use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use serde::Serialize;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
@@ -7,11 +12,144 @@ use std::os::linux::net::TcpStreamExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+type HmacSha256 = Hmac<Sha256>;
+
+/// JWT Header
+#[derive(Serialize)]
+struct JwtHeader {
+    alg: String,
+    typ: String,
+}
+
+/// JWT Claims
+#[derive(Serialize)]
+struct JwtClaims {
+    sub: String,
+    exp: i64,
+    iat: i64,
+    aud: String,
+    iss: String,
+    jti: String,
+    token_use: String,
+    user: JwtUser,
+}
+
+/// JWT User info
+#[derive(Serialize)]
+struct JwtUser {
+    email: String,
+    full_name: String,
+    is_admin: bool,
+    auth_provider: String,
+}
+
+/// Benchmark configuration
+struct BenchmarkConfig {
+    host: String,
+    server_id: String,
+    jwt_secret_key: String,
+    jwt_algorithm: String,
+    jwt_audience: String,
+    jwt_issuer: String,
+    jwt_username: String,
+    bearer_token: Option<String>,
+}
+
+impl Default for BenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            host: env::var("K6_MCP_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            server_id: env::var("K6_MCP_SERVER_ID").unwrap_or_default(),
+            jwt_secret_key: env::var("K6_JWT_SECRET_KEY")
+                .unwrap_or_else(|_| "my-test-key-but-now-longer-than-32-bytes".to_string()),
+            jwt_algorithm: env::var("K6_JWT_ALGORITHM").unwrap_or_else(|_| "HS256".to_string()),
+            jwt_audience: env::var("K6_JWT_AUDIENCE").unwrap_or_else(|_| "mcpgateway-api".to_string()),
+            jwt_issuer: env::var("K6_JWT_ISSUER").unwrap_or_else(|_| "mcpgateway".to_string()),
+            jwt_username: env::var("K6_JWT_USERNAME").unwrap_or_else(|_| "admin@example.com".to_string()),
+            bearer_token: env::var("K6_BEARER_TOKEN").ok(),
+        }
+    }
+}
+
+/// Generate a JWT token matching gateway expectations
+fn generate_jwt_token(config: &BenchmarkConfig) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let exp = now + 8760 * 3600; // 1 year
+
+    // Generate random JTI
+    let mut rng = rand::rng();
+    let jti_bytes: [u8; 16] = rng.random();
+    let jti: String = jti_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    let header = JwtHeader {
+        alg: config.jwt_algorithm.clone(),
+        typ: "JWT".to_string(),
+    };
+
+    let claims = JwtClaims {
+        sub: config.jwt_username.clone(),
+        exp,
+        iat: now,
+        aud: config.jwt_audience.clone(),
+        iss: config.jwt_issuer.clone(),
+        jti,
+        token_use: "session".to_string(),
+        user: JwtUser {
+            email: config.jwt_username.clone(),
+            full_name: "Rust MCP Benchmark".to_string(),
+            is_admin: true,
+            auth_provider: "local".to_string(),
+        },
+    };
+
+    // Serialize and encode header
+    let header_json = serde_json::to_string(&header).unwrap();
+    let header_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+
+    // Serialize and encode payload
+    let claims_json = serde_json::to_string(&claims).unwrap();
+    let claims_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
+
+    // Create signature
+    let message = format!("{}.{}", header_encoded, claims_encoded);
+    let mut mac = HmacSha256::new_from_slice(config.jwt_secret_key.as_bytes()).unwrap();
+    mac.update(message.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    let signature_encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&signature);
+
+    format!("{}.{}.{}", header_encoded, claims_encoded, signature_encoded)
+}
+
+/// Get or generate JWT token (cached for benchmark duration)
+fn get_bearer_token(config: &BenchmarkConfig) -> String {
+    if let Some(token) = &config.bearer_token {
+        info!("Using pre-configured bearer token");
+        return token.clone();
+    }
+    let token = generate_jwt_token(config);
+    // Debug: print token parts (masked)
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() == 3 {
+        let header_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0]).unwrap_or_default();
+        let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]).unwrap_or_default();
+        debug!("JWT Header: {}", String::from_utf8_lossy(&header_json));
+        debug!("JWT Payload: {}", String::from_utf8_lossy(&payload_json));
+        debug!("JWT Signature: {}...", &parts[2][..8.min(parts[2].len())]);
+    }
+    debug!("JWT Token generated: {}...", &token[..20.min(token.len())]);
+    token
+}
+
+use sha2::Sha256;
+
 #[derive(Parser, Debug)]
 #[command(name = "test-with-rust")]
 #[command(about = "MCP benchmark tool")]
 struct Args {
-    #[arg(short = 's', default_value = "http://localhost:8000/mcp")]
+    #[arg(short = 's', default_value = "")]
     server_url: String,
 
     #[arg(short = 'r', default_value = "100")]
@@ -29,6 +167,10 @@ struct Args {
 
     #[arg(short = 'u', default_value = "1")]
     users: usize,
+
+    /// Enable JWT token generation for authentication
+    #[arg(long = "with-jwt", default_value = "false")]
+    with_jwt: bool,
 }
 
 struct UserSession {
@@ -86,7 +228,15 @@ impl PhaseStats {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
+
     let mut args = Args::parse();
+
+    // Create benchmark config from environment variables
+    let config = BenchmarkConfig::default();
 
     // Override runs from environment if set
     if let Ok(r) = env::var("RUNS") {
@@ -97,7 +247,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let url = &args.server_url;
+    // Use server_url from args if provided, otherwise from config
+    let url = if args.server_url.is_empty() {
+        format!("{}/servers/{}/mcp", config.host, config.server_id)
+    } else {
+        args.server_url.clone()
+    };
+
+    // Get or generate JWT token if --with-jwt flag is set
+    let bearer_token = if args.with_jwt {
+        Some(get_bearer_token(&config))
+    } else {
+        None
+    };
+
     let init_runs = args.init_runs.unwrap_or(args.runs);
     let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"demo","version":"0.0.1"}}}"#;
     let notify_req = r#"{"jsonrpc": "2.0","method": "notifications/initialized"}"#;
@@ -117,6 +280,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         HeaderValue::from_static("application/json, application/x-ndjson, text/event-stream"),
     );
 
+    // Add JWT authorization header if enabled
+    if let Some(ref token) = bearer_token {
+        base_headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token))?,
+        );
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -127,13 +298,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   Users: {}, Init runs: {}, Tool call runs: {}",
         args.users, init_runs, args.runs
     );
-    println!("   Server: {}", args.server_url);
+    println!("   Server: {}", url);
+    if args.with_jwt {
+        info!("JWT authentication enabled");
+    }
 
     // Best-effort tool verification (to match sdk-benchmark output shape)
     println!("   Verifying tool '{}' exists...", args.tool_name);
     verify_tool_exists(
         &client,
-        url,
+        &url,
         &base_headers,
         init_req,
         notify_req,
@@ -149,10 +323,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_runs,
         args.users * init_runs
     );
-    println!("   Server: {}", args.server_url);
+    println!("   Server: {}", url);
     let init_phase = run_init_phase(
         &client,
-        url,
+        &url,
         &base_headers,
         init_req,
         notify_req,
@@ -164,7 +338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create sessions for list/tools and tool/call phases
     let sessions = create_sessions(
         &client,
-        url,
+        &url,
         &base_headers,
         init_req,
         notify_req,
@@ -178,10 +352,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_runs,
         args.users * init_runs
     );
-    println!("   Server: {}", args.server_url);
+    println!("   Server: {}", url);
     let list_phase = run_list_phase(
         &client,
-        url,
+        &url,
         &base_headers,
         &sessions,
         list_req,
@@ -196,11 +370,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.runs,
         args.users * args.runs
     );
-    println!("   Server: {}", args.server_url);
+    println!("   Server: {}", url);
     println!("   Tool: {}", args.tool_name);
     let tool_call_phase = run_tool_call_phase(
         &client,
-        url,
+        &url,
         &base_headers,
         &sessions,
         &call_req,
